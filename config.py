@@ -14,11 +14,11 @@ MODULATION = 'QPSK'
 BITS_PER_SYMBOL = 2
 
 # Simulation Parameters
-SNR_DB = np.arange(0, 11, 1)  # SNR region [-5, 10]
-ITERATIONS = 480           # Monte-Carlo trials per SNR point
+SNR_DB = np.arange(0, 6, 1)  # SNR region [-5, 10]
+ITERATIONS = 64000           # Monte-Carlo trials per SNR point
 
 # Blind Frame Synchronization Parameters
 MAX_SYMBOL_OFFSET = 10        # Maximum timing offset in QPSK symbols
 
-NUM_H0_TRIALS = 16000      # Need >=1000 to resolve P_false = 1e-3 accurately
-NUM_H1_TRIALS = 8000
+NUM_H0_TRIALS = 32000      # Need >=1000 to resolve P_false = 1e-3 accurately
+NUM_H1_TRIALS = 16000
