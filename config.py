@@ -1,7 +1,7 @@
 import numpy as np
 
 # Polar Code Parameters
-N = 512
+N = 256
 K_LIST = [128, 256]
 
 # SCL Decoder Parameters
