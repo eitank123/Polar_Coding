@@ -1,65 +1,53 @@
+import os
 import numpy as np
 
+
+def bit_reversal_permutation(N):
+    n = int(np.log2(N))
+    return np.array([int(format(i, f"0{n}b")[::-1], 2) for i in range(N)])
+
+
 def get_frozen_bits(N, K, design_snr_dB=0.0):
-    """Generates frozen bit set using Bhattacharyya bounds for AWGN."""
+    """Generates frozen bit set using Bhattacharyya bounds for AWGN.
+
+    The returned mask is in natural (non-bit-reversed) order, matching the
+    G = F^{(x)n} encoder / SC tree used by Sionna's polar blocks.
+    """
     snr_linear = 10 ** (design_snr_dB / 10)
     z = np.exp(-snr_linear)
     n = int(np.log2(N))
     Z = np.zeros(N)
     Z[0] = z
-    
+
     for i in range(1, n + 1):
         stride = 2**(i-1)
         for j in range(stride):
             z_prev = Z[j]
-            Z[j] = 2 * z_prev - z_prev**2       
-            Z[j + stride] = z_prev**2           
-            
+            Z[j] = 2 * z_prev - z_prev**2
+            Z[j + stride] = z_prev**2
+
+    # The recursion above polarizes the LSB first, i.e. it yields Z in
+    # bit-reversed order; the natural-order encoder polarizes the MSB first.
+    Z = Z[bit_reversal_permutation(N)]
+
     indices = np.argsort(Z)
     frozen_bits = np.ones(N, dtype=bool)
     frozen_bits[indices[:K]] = False
     return frozen_bits
 
-def append_crc(data, crc_poly):
-    """Appends CRC bits to data."""
-    crc_len = len(crc_poly) - 1
-    padded = np.pad(data, (0, crc_len), 'constant')
-    for i in range(len(data)):
-        if padded[i] == 1:
-            padded[i:i+crc_len+1] ^= crc_poly
-    crc = padded[-crc_len:]
-    return np.concatenate((data, crc))
 
-def check_crc(data_with_crc, crc_poly):
-    """Verifies CRC consistency."""
-    crc_len = len(crc_poly) - 1
-    padded = np.copy(data_with_crc)
-    for i in range(len(data_with_crc) - crc_len):
-        if padded[i] == 1:
-            padded[i:i+crc_len+1] ^= crc_poly
-    return np.sum(padded[-crc_len:]) == 0
+def get_frozen_positions(N, K, design_snr_dB=0.0):
+    """Frozen-bit indices (the format Sionna's polar blocks expect)."""
+    return np.where(get_frozen_bits(N, K, design_snr_dB))[0].astype(int)
 
-def qpsk_modulate(x):
-    """Modulates length-N binary vector x into N/2 QPSK symbols."""
-    x_in_phase = x[0::2]
-    x_quad = x[1::2]
-    s_i = (1 - 2 * x_in_phase) / np.sqrt(2)
-    s_q = (1 - 2 * x_quad) / np.sqrt(2)
-    return s_i + 1j * s_q
 
-def qpsk_demodulate_llr(y, sigma2):
-    """Computes LLRs for N bits from N/2 complex QPSK symbols y."""
-    llr_i = 2 * np.real(y) * np.sqrt(2) / sigma2
-    llr_q = 2 * np.imag(y) * np.sqrt(2) / sigma2
-    llr = np.empty(2 * len(y), dtype=np.float64)
-    llr[0::2] = llr_i
-    llr[1::2] = llr_q
-    return llr
-
-def get_noise_sigma(snr_dB, K, N, bits_per_symbol=2):
-    """Calculates AWGN noise standard deviation for a given Eb/N0."""
-    snr_linear = 10 ** (snr_dB / 10)
-    rate = K / N
-    eb_n0_linear = rate * bits_per_symbol * snr_linear
-    sigma2 = 1 / (2 * eb_n0_linear)
-    return np.sqrt(sigma2), sigma2
+def available_cpus():
+    """CPUs actually granted to this container (cgroup quota), not the host count."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    return len(os.sched_getaffinity(0))

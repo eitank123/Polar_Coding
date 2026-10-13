@@ -1,686 +1,183 @@
-import numpy as np
-from numba import njit
+"""Polar-coded QPSK/AWGN link built from Sionna (PyTorch) blocks.
 
-def f_vec(a, b):
-    a_c = np.clip(a, -100.0, 100.0)
-    b_c = np.clip(b, -100.0, 100.0)
-    return np.sign(a_c) * np.sign(b_c) * np.minimum(np.abs(a_c), np.abs(b_c))
+LLR conventions: Sionna passes *logits* log p(b=1)/p(b=0) between blocks. The
+sync/detection metrics returned by the decoders below use the classic LLR
+convention log p(b=0)/p(b=1), matching the original (pre-Sionna) definitions:
 
-def g_vec(a, b, c_left):
-    a_c = np.clip(a, -100.0, 100.0)
-    b_c = np.clip(b, -100.0, 100.0)
-    return b_c + (1 - 2 * c_left) * a_c
+* SC  metric: sum of the frozen-leaf decision LLRs along the SC path
+  (large and positive when the frozen bits look like zeros, i.e. a valid frame).
+* SCL metric: -PM of the selected path (the CRC-passing path with the smallest
+  path metric, or the smallest-PM path if none passes), so larger = better.
+"""
+import torch
+from sionna.phy import config as sionna_config
+from sionna.phy.channel import AWGN
+from sionna.phy.fec.crc import CRCEncoder
+from sionna.phy.fec.polar import PolarEncoder, PolarSCDecoder, PolarSCLDecoder
+from sionna.phy.mapping import BinarySource, Demapper, Mapper
+from sionna.phy.utils import ebnodb2no
 
-@njit
-def _f_numba(a, b):
-
-    # Manual scalar clipping
-    if a < -100.0:
-        a_c = -100.0
-    elif a > 100.0:
-        a_c = 100.0
-    else:
-        a_c = a
-
-    if b < -100.0:
-        b_c = -100.0
-    elif b > 100.0:
-        b_c = 100.0
-    else:
-        b_c = b
-
-    # sign(a)
-    if a_c > 0.0:
-        sa = 1.0
-    elif a_c < 0.0:
-        sa = -1.0
-    else:
-        sa = 0.0
-
-    # sign(b)
-    if b_c > 0.0:
-        sb = 1.0
-    elif b_c < 0.0:
-        sb = -1.0
-    else:
-        sb = 0.0
-
-    abs_a = abs(a_c)
-    abs_b = abs(b_c)
-
-    if abs_a < abs_b:
-        minimum = abs_a
-    else:
-        minimum = abs_b
-
-    return sa * sb * minimum
+from utils import get_frozen_positions
 
 
-@njit
-def _g_numba(a, b, c_left):
+class PolarSCDecoderWithMetric(PolarSCDecoder):
+    """Sionna SC decoder that additionally returns the frozen-bit sync metric."""
 
-    if a < -100.0:
-        a_c = -100.0
-    elif a > 100.0:
-        a_c = 100.0
-    else:
-        a_c = a
+    def _polar_decode_sc(self, llr_ch, frozen_ind):
+        # Sionna's recursion calls back into this override at every tree node,
+        # so the frozen leaves see exactly the LLRs the SC decision is based on.
+        if frozen_ind.shape[0] == 1 and bool(frozen_ind[0] == 1):
+            self._frozen_llr_sum += llr_ch[..., 0]
+        return super()._polar_decode_sc(llr_ch, frozen_ind)
 
-    if b < -100.0:
-        b_c = -100.0
-    elif b > 100.0:
-        b_c = 100.0
-    else:
-        b_c = b
+    def call(self, llr_ch):
+        batch_shape = llr_ch.shape[:-1]
+        self._frozen_llr_sum = torch.zeros(
+            batch_shape.numel(), dtype=self.dtype, device=llr_ch.device)
+        u_hat = super().call(llr_ch)
+        metric = self._frozen_llr_sum.reshape(batch_shape)
+        del self._frozen_llr_sum
+        return u_hat, metric
 
-    return b_c + (1.0 - 2.0 * c_left) * a_c
 
+class PolarSCLDecoderWithMetric(PolarSCLDecoder):
+    """Sionna CA-SCL decoder that additionally returns -PM of the selected path.
 
-@njit
-def _update_c_numba(C, NODE_OFFSETS, NODE_SIZES, N, i, path, u_i):
-    v = N + i
+    Path selection replicates ``PolarSCLDecoder.call`` (Sionna 2.2); the
+    ``test_scl_wrapper_matches_sionna`` test guards against upstream drift.
+    """
 
-    off_v = NODE_OFFSETS[v]
-    C[path, off_v] = u_i
+    def call(self, llr_ch):
+        if self._iil:
+            raise NotImplementedError("CRC input-bit interleaving is not supported.")
+        input_shape = llr_ch.shape
+        llr_ch = llr_ch.reshape(-1, self._n)
+        llr_ch = torch.clamp(-llr_ch, -self._llr_max, self._llr_max)
 
-    p = v >> 1
+        bits, pm = self._decode(llr_ch)  # [B, 2L, n], [B, 2L]
 
-    while p >= 1:
-
-        if v % 2 == 1:
-
-            left_child = v - 1
-            right_child = v
-
-            off_p = NODE_OFFSETS[p]
-            off_l = NODE_OFFSETS[left_child]
-            off_r = NODE_OFFSETS[right_child]
-
-            half = NODE_SIZES[right_child]
-
-            for j in range(half):
-                C[path, off_p + j] = (
-                    C[path, off_l + j]
-                    + C[path, off_r + j]
-                ) % 2
-
-            for j in range(half):
-                C[path, off_p + half + j] = (
-                    C[path, off_r + j]
-                )
-
-            v = p
-            p = v >> 1
-
+        batch_idx = torch.arange(bits.shape[0], device=bits.device)
+        if self._use_crc:
+            u_list = bits[:, :, self._info_pos_t].to(llr_ch.dtype)
+            _, crc_valid = self._crc_decoder(u_list)
+            crc_valid = crc_valid.squeeze(-1)
+            penalty = (1.0 - crc_valid.to(pm.dtype)) * self._llr_max * self._k
+            cand = torch.argmin(pm + penalty, dim=-1)
+            crc_ok = crc_valid[batch_idx, cand]
         else:
-            break
-
-
-@njit
-def _decode_scl_numba_core(
-    llr,
-    L,
-    N,
-    n,
-    frozen_bits,
-    NODE_OFFSETS,
-    NODE_SIZES
-):
-    mem_size = (n + 1) * N
-
-    LLR = np.zeros(
-        (L, mem_size),
-        dtype=np.float64
-    )
-
-    C = np.zeros(
-        (L, mem_size),
-        dtype=np.int8
-    )
-
-    U_dec = np.zeros(
-        (L, N),
-        dtype=np.int8
-    )
-
-    PM = np.zeros(
-        L,
-        dtype=np.float64
-    )
-
-    Frozen_Sum = np.zeros(
-        L,
-        dtype=np.float64
-    )
-
-    LLR[0, :N] = llr
-
-    num_active = 1
-
-    for i in range(N):
-
-        # ----------------------------------------------------
-        # Exact equivalent of:
-        #
-        # d_start = 1 if i == 0 else \
-        #     n - (i & -i).bit_length() + 1
-        #
-        # Numba does not support int.bit_length().
-        # ----------------------------------------------------
-
-        if i == 0:
-
-            d_start = 1
-
-        else:
-
-            x = i & (-i)
-
-            bit_length = 0
-
-            while x > 0:
-                x = x >> 1
-                bit_length += 1
-
-            d_start = n - bit_length + 1
-
-        # ----------------------------------------------------
-        # LLR tree traversal
-        # ----------------------------------------------------
-
-        for l in range(num_active):
-
-            for d in range(d_start, n + 1):
-
-                v = (N + i) >> (n - d)
-
-                p = v >> 1
-
-                off_p = NODE_OFFSETS[p]
-                off_v = NODE_OFFSETS[v]
-
-                half = NODE_SIZES[v]
-
-                if v % 2 == 0:
-
-                    for j in range(half):
-
-                        a = LLR[l,off_p + j]
-
-                        b = LLR[l,off_p + half + j]
-
-                        LLR[l,off_v + j] = _f_numba(a, b)
-
-                else:
-
-                    off_left = NODE_OFFSETS[v - 1]
-
-                    for j in range(half):
-
-                        a = LLR[
-                            l,
-                            off_p + j
-                        ]
-
-                        b = LLR[
-                            l,
-                            off_p + half + j
-                        ]
-
-                        c = C[
-                            l,
-                            off_left + j
-                        ]
-
-                        LLR[
-                            l,
-                            off_v + j
-                        ] = _g_numba(a, b, c)
-
-        # ----------------------------------------------------
-        # Leaf
-        # ----------------------------------------------------
-
-        leaf_v = N + i
-
-        off_leaf = NODE_OFFSETS[leaf_v]
-
-        # Maximum number of candidates = 2L
-        max_candidates = 2 * L
-
-        cand_parent = np.empty(
-            max_candidates,
-            dtype=np.int64
-        )
-
-        cand_bit = np.empty(
-            max_candidates,
-            dtype=np.int8
-        )
-
-        cand_pm = np.empty(
-            max_candidates,
-            dtype=np.float64
-        )
-
-        cand_f = np.empty(
-            max_candidates,
-            dtype=np.float64
-        )
-
-        num_candidates = 0
-
-        # ----------------------------------------------------
-        # Candidate generation
-        # EXACTLY mirrors decode_scl()
-        # ----------------------------------------------------
-
-        if frozen_bits[i]:
-
-            for l in range(num_active):
-
-                lambda_val = LLR[
-                    l,
-                    off_leaf
-                ]
-
-                if lambda_val < 0.0:
-                    pm_penalty = abs(lambda_val)
-                else:
-                    pm_penalty = 0.0
-
-                cand_parent[num_candidates] = l
-                cand_bit[num_candidates] = 0
-                cand_pm[num_candidates] = (
-                    PM[l] + pm_penalty
-                )
-                cand_f[num_candidates] = lambda_val
-
-                num_candidates += 1
-
-        else:
-
-            for l in range(num_active):
-
-                lambda_val = LLR[
-                    l,
-                    off_leaf
-                ]
-
-                if lambda_val < 0.0:
-
-                    pm0 = PM[l] + abs(lambda_val)
-
-                else:
-
-                    pm0 = PM[l]
-
-                if lambda_val >= 0.0:
-
-                    pm1 = PM[l] + abs(lambda_val)
-
-                else:
-
-                    pm1 = PM[l]
-
-                # Candidate 0
-                cand_parent[num_candidates] = l
-                cand_bit[num_candidates] = 0
-                cand_pm[num_candidates] = pm0
-                cand_f[num_candidates] = 0.0
-
-                num_candidates += 1
-
-                # Candidate 1
-                cand_parent[num_candidates] = l
-                cand_bit[num_candidates] = 1
-                cand_pm[num_candidates] = pm1
-                cand_f[num_candidates] = 0.0
-
-                num_candidates += 1
-
-        # ----------------------------------------------------
-        # Stable insertion sort by PM
-        #
-        # Python:
-        # candidates.sort(key=lambda x: x[2])
-        #
-        # Using < rather than <= preserves candidate order
-        # when metrics are equal.
-        # ----------------------------------------------------
-
-        for a in range(1, num_candidates):
-
-            parent_tmp = cand_parent[a]
-            bit_tmp = cand_bit[a]
-            pm_tmp = cand_pm[a]
-            f_tmp = cand_f[a]
-
-            b = a - 1
-
-            while b >= 0 and cand_pm[b] > pm_tmp:
-
-                cand_parent[b + 1] = cand_parent[b]
-                cand_bit[b + 1] = cand_bit[b]
-                cand_pm[b + 1] = cand_pm[b]
-                cand_f[b + 1] = cand_f[b]
-
-                b -= 1
-
-            cand_parent[b + 1] = parent_tmp
-            cand_bit[b + 1] = bit_tmp
-            cand_pm[b + 1] = pm_tmp
-            cand_f[b + 1] = f_tmp
-
-        # ----------------------------------------------------
-        # Select first L candidates
-        # ----------------------------------------------------
-
-        new_num_active = num_candidates
-
-        if new_num_active > L:
-            new_num_active = L
-
-        LLR_next = np.empty_like(LLR)
-        C_next = np.empty_like(C)
-        U_next = np.empty_like(U_dec)
-
-        PM_next = np.zeros(
-            L,
-            dtype=np.float64
-        )
-
-        Frozen_Next = np.zeros(
-            L,
-            dtype=np.float64
-        )
-
-        for idx in range(new_num_active):
-
-            p_old = cand_parent[idx]
-            u_i = cand_bit[idx]
-            pm_val = cand_pm[idx]
-            f_val = cand_f[idx]
-
-            # Exact copies from original decoder
-            LLR_next[idx, :] = LLR[p_old, :]
-            C_next[idx, :] = C[p_old, :]
-            U_next[idx, :] = U_dec[p_old, :]
-
-            U_next[idx, i] = u_i
-
-            PM_next[idx] = pm_val
-
-            Frozen_Next[idx] = (
-                Frozen_Sum[p_old] + f_val
-            )
-
-            _update_c_numba(
-                C_next,
-                NODE_OFFSETS,
-                NODE_SIZES,
-                N,
-                i,
-                idx,
-                u_i
-            )
-
-        LLR = LLR_next
-        C = C_next
-        U_dec = U_next
-        PM = PM_next
-        Frozen_Sum = Frozen_Next
-
-        num_active = new_num_active
-
-    return (
-        U_dec,
-        PM,
-        Frozen_Sum,
-        num_active
-    )
-
-class PolarCode:
-    def __init__(self, N, frozen_bits):
-        self.N = N
-        self.n = int(np.log2(N))
-        self.frozen_bits = frozen_bits
-
-        # Pre-compute binary tree node indexing tables
-        self.NODE_OFFSETS = np.zeros(2 * N, dtype=int)
-        self.NODE_SIZES = np.zeros(2 * N, dtype=int)
-        for v in range(1, 2 * N):
-            d = v.bit_length() - 1
-            j = v - (1 << d)
-            size = N >> d
-            self.NODE_SIZES[v] = size
-            self.NODE_OFFSETS[v] = d * N + j * size
-
-    def encode(self, u_info):
-        """Polar Kronecker encoding."""
-        u = np.zeros(self.N, dtype=int)
-        u[~self.frozen_bits] = u_info
-        x = np.copy(u)
-        for d in range(self.n):
-            stride = 2**d
-            for i in range(0, self.N, 2*stride):
-                for j in range(stride):
-                    x[i+j] = (x[i+j] + x[i+j+stride]) % 2
-        return x
-
-    def decode_sc(self, llr, return_sync_metric=False):
-        """Successive Cancellation decoder."""
-        return self.decode_scl(llr, L=1, crc_poly=None, return_sync_metric=return_sync_metric)
-
-    def _update_c(self, C, l, i, u_i):
-        v = self.N + i
-        off_v = self.NODE_OFFSETS[v]
-        C[l, off_v] = u_i
-        p = v >> 1
-        while p >= 1:
-            if v % 2 == 1: 
-                left_child = v - 1
-                right_child = v
-                off_p = self.NODE_OFFSETS[p]
-                off_l = self.NODE_OFFSETS[left_child]
-                off_r = self.NODE_OFFSETS[right_child]
-                half = self.NODE_SIZES[right_child]
-                
-                C[l, off_p : off_p + half] = (C[l, off_l : off_l + half] + C[l, off_r : off_r + half]) % 2
-                C[l, off_p + half : off_p + 2 * half] = C[l, off_r : off_r + half]
-                v = p
-                p = v >> 1
-            else:
-                break
-
-    def decode_scl(self, llr, L, crc_poly=None, return_sync_metric=False):
-        """Vectorized SCL Decoder supporting metric extraction for frame sync."""
-        mem_size = (self.n + 1) * self.N
-        LLR = np.zeros((L, mem_size), dtype=np.float64)
-        C = np.zeros((L, mem_size), dtype=np.int8)
-        U_dec = np.zeros((L, self.N), dtype=np.int8)
-        PM = np.zeros(L, dtype=np.float64)
-        Frozen_Sum = np.zeros(L, dtype=np.float64)
-
-        LLR[0, :self.N] = llr
-        num_active = 1
-
-        for i in range(self.N):
-            d_start = 1 if i == 0 else self.n - (i & -i).bit_length() + 1
-
-            for l in range(num_active):
-                for d in range(d_start, self.n + 1):
-                    v = (self.N + i) >> (self.n - d)
-                    p = v >> 1
-                    off_p = self.NODE_OFFSETS[p]
-                    off_v = self.NODE_OFFSETS[v]
-                    half = self.NODE_SIZES[v]
-
-                    if v % 2 == 0:  
-                        LLR[l, off_v : off_v + half] = f_vec(
-                            LLR[l, off_p : off_p + half],
-                            LLR[l, off_p + half : off_p + 2 * half]
-                        )
-                    else:  
-                        off_left = self.NODE_OFFSETS[v - 1]
-                        LLR[l, off_v : off_v + half] = g_vec(
-                            LLR[l, off_p : off_p + half],
-                            LLR[l, off_p + half : off_p + 2 * half],
-                            C[l, off_left : off_left + half]
-                        )
-
-            leaf_v = self.N + i
-            off_leaf = self.NODE_OFFSETS[leaf_v]
-
-            candidates = []
-            if self.frozen_bits[i]:
-                for l in range(num_active):
-                    lambda_val = LLR[l, off_leaf]
-                    pm_penalty = abs(lambda_val) if lambda_val < 0 else 0.0
-                    candidates.append((l, 0, PM[l] + pm_penalty, lambda_val))
-            else:
-                for l in range(num_active):
-                    lambda_val = LLR[l, off_leaf]
-                    pm0 = PM[l] + (abs(lambda_val) if lambda_val < 0 else 0.0)
-                    pm1 = PM[l] + (abs(lambda_val) if lambda_val >= 0 else 0.0)
-                    candidates.append((l, 0, pm0, 0.0))
-                    candidates.append((l, 1, pm1, 0.0))
-
-            candidates.sort(key=lambda x: x[2])
-            selected = candidates[:L]
-            num_active = len(selected)
-
-            LLR_next = np.empty_like(LLR)
-            C_next = np.empty_like(C)
-            U_next = np.empty_like(U_dec)
-            PM_next = np.zeros(L, dtype=np.float64)
-            Frozen_Next = np.zeros(L, dtype=np.float64)
-
-            for idx, (p_old, u_i, pm_val, f_val) in enumerate(selected):
-                LLR_next[idx] = LLR[p_old]
-                C_next[idx] = C[p_old]
-                U_next[idx] = U_dec[p_old]
-                U_next[idx, i] = u_i
-                PM_next[idx] = pm_val
-                Frozen_Next[idx] = Frozen_Sum[p_old] + f_val
-                self._update_c(C_next, idx, i, u_i)
-
-            LLR, C, U_dec, PM, Frozen_Sum = LLR_next, C_next, U_next, PM_next, Frozen_Next
-
-        # Candidate path selection
-        best_pm_idx = np.argmin(PM[:num_active])
-        if crc_poly is not None:
-            from utils import check_crc
-            best_pm_crc = float('inf')
-            for l in range(num_active):
-                u_cand = U_dec[l, ~self.frozen_bits]
-                if check_crc(u_cand, crc_poly):
-                    if PM[l] < best_pm_crc:
-                        best_pm_crc = PM[l]
-                        best_pm_idx = l
-                        
-        best_u = U_dec[best_pm_idx, ~self.frozen_bits]
-
-        if return_sync_metric:
-            if L == 1:
-                # SC Frozen-bit metric: Sum of LLRs
-                return best_u, Frozen_Sum[0]
-            else:
-                # SCL Path metric: Inverted so that max value corresponds to correct sync
-                return best_u, -PM[best_pm_idx]
-                
-        return best_u
-    
-    def decode_scl_numba(
-        self,
-        llr,
-        L,
-        crc_poly=None,
-        return_sync_metric=False
-    ):
+            cand = torch.argmin(pm, dim=-1)
+            crc_ok = torch.ones_like(cand, dtype=torch.bool)
+
+        u_hat = bits[batch_idx, cand][:, self._info_pos_t].to(llr_ch.dtype)
+        metric = -pm[batch_idx, cand]
+
+        batch_shape = list(input_shape[:-1])
+        return (u_hat.reshape(batch_shape + [self._k]),
+                metric.reshape(batch_shape),
+                crc_ok.reshape(batch_shape))
+
+
+class PolarLink:
+    """CRC + polar encoder + QPSK + AWGN + SC / CA-SCL decoders for one (N, K)."""
+
+    def __init__(self, N, K, list_size, crc_degree, bits_per_symbol=2,
+                 design_snr_db=0.0, precision=None):
+        self.N, self.K = N, K
+        self.list_size, self.precision = list_size, precision
+        self.bits_per_symbol = bits_per_symbol
+        self.frozen_pos = get_frozen_positions(N, K, design_snr_db)
+
+        self.source = BinarySource(precision=precision)
+        self.crc_encoder = CRCEncoder(crc_degree, precision=precision)
+        self.info_len = K - self.crc_encoder.crc_length
+        self.encoder = PolarEncoder(self.frozen_pos, N, precision=precision)
+        self.mapper = Mapper("qam", bits_per_symbol, precision=precision)
+        self.channel = AWGN(precision=precision)
+        self.demapper = Demapper("app", "qam", bits_per_symbol, precision=precision)
+        self.sc = PolarSCDecoderWithMetric(self.frozen_pos, N, precision=precision)
+        self.scl = PolarSCLDecoderWithMetric(
+            self.frozen_pos, N, list_size=list_size, crc_degree=crc_degree,
+            precision=precision)
+
+    def noise_var(self, ebno_db):
+        """Complex noise variance N0 for Eb/N0 [dB], Es = 1.
+
+        Eb is the energy per *information* bit: the CRC bits are overhead, so the
+        rate is info_len / N (not K / N). Preamble overhead is added in window_stream.
         """
-        Numba-accelerated SCL decoder.
+        return ebnodb2no(float(ebno_db), self.bits_per_symbol, self.info_len / self.N)
 
-        Algorithmically matches decode_scl().
+    def frame(self, num_trials, ebno_db):
+        """One packet per trial, perfectly aligned. Returns info bits and logits [T, N]."""
+        no = self.noise_var(ebno_db)
+        info_bits = self.source([num_trials, self.info_len])
+        symbols = self.mapper(self.encoder(self.crc_encoder(info_bits)))
+        return info_bits, self.demapper(self.channel(symbols, no), no)
+
+    def window_stream(self, num_trials, max_offset_sym, ebno_db, preamble=None, signal=True):
+        """Observation stream for sliding-window sync (Parts 4/5).
+
+        The transmitted block [preamble | QPSK data] starts at a uniform random
+        symbol offset in [0, max_offset_sym]; silence elsewhere. With signal=False
+        the stream is noise only (H0). Eb counts *all* transmitted energy
+        (preamble + data, Es = 1 per symbol), so a preamble raises N0 by
+        (n_pre + n_data) / n_data at the same Eb/N0.
+
+        Returns info bits [T, info_len] (None for H0), received symbols
+        [T, max_offset_sym + n_pre + n_data], N0, and the true offset [T].
         """
+        n_data = self.N // self.bits_per_symbol
+        n_pre = 0 if preamble is None else preamble.shape[-1]
+        no = self.noise_var(ebno_db) * (n_pre + n_data) / n_data
+        offset = torch.randint(max_offset_sym + 1, (num_trials,), generator=sionna_config.torch_rng())
+        stream = torch.zeros((num_trials, max_offset_sym + n_pre + n_data), dtype=self.mapper.cdtype)
+        info_bits = None
+        if signal:
+            info_bits = self.source([num_trials, self.info_len])
+            tx = self.mapper(self.encoder(self.crc_encoder(info_bits)))
+            if preamble is not None:
+                tx = torch.cat([preamble.to(tx.dtype).expand(num_trials, -1), tx], dim=1)
+            idx = offset[:, None] + torch.arange(n_pre + n_data)
+            stream.scatter_(1, idx, tx)
+        return info_bits, self.channel(stream, no), no, offset
 
-        U_dec, PM, Frozen_Sum, num_active = _decode_scl_numba_core(
-            llr,
-            L,
-            self.N,
-            self.n,
-            self.frozen_bits,
-            self.NODE_OFFSETS,
-            self.NODE_SIZES
-        )
+    def burst(self, num_trials, max_start, ebno_db, step=1):
+        """One packet starting at a uniformly random bit in {0, step, 2*step, ..., max_start}.
 
-        # --------------------------------------------------------
-        # Candidate path selection
-        # --------------------------------------------------------
+        step=1: any bit. step=N: N-bit slots (with max_start=4N: one packet in a
+        random slot of a 5-slot burst). Everything outside the packet is silence.
+        The receive window is max_start + N coded bits long. QPSK is two
+        independent BPSK rails (Gray, bit 2i -> I, bit 2i+1 -> Q), so an odd
+        start simply puts the packet's first bit on the Q rail; empty bit
+        positions carry zero amplitude (noise only).
 
-        best_pm_idx = 0
+        Returns info bits [T, info_len], channel logits [T, max_start + N]
+        and the true start bit [T].
+        """
+        if (max_start + self.N) % self.bits_per_symbol:
+            raise ValueError("max_start + N must be a multiple of bits_per_symbol.")
+        if max_start % step:
+            raise ValueError("max_start must be a multiple of step.")
+        if self.bits_per_symbol != 2:
+            raise NotImplementedError("Bit-granular offsets are implemented for QPSK only.")
+        no = self.noise_var(ebno_db)
+        info_bits = self.source([num_trials, self.info_len])
+        symbols = self.mapper(self.encoder(self.crc_encoder(info_bits)))  # [T, N/2]
+        amplitudes = torch.view_as_real(symbols).reshape(num_trials, self.N)  # per-bit rail amplitude
 
-        for l in range(1, num_active):
+        start = step * torch.randint(max_start // step + 1, (num_trials,),
+                                     generator=sionna_config.torch_rng(), device=symbols.device)
+        rails = amplitudes.new_zeros((num_trials, max_start + self.N))
+        idx = start[:, None] + torch.arange(self.N, device=symbols.device)
+        rails.scatter_(1, idx, amplitudes)
+        stream = torch.complex(rails[:, 0::2], rails[:, 1::2])
 
-            if PM[l] < PM[best_pm_idx]:
-                best_pm_idx = l
+        llr = self.demapper(self.channel(stream, no), no)
+        return info_bits, llr, start
 
-        # --------------------------------------------------------
-        # CRC-aided selection
-        #
-        # CRC checking remains in Python because your existing
-        # check_crc() is already implemented there.
-        # --------------------------------------------------------
-
-        if crc_poly is not None:
-
-            from utils import check_crc
-
-            best_pm_crc = float("inf")
-
-            for l in range(num_active):
-
-                u_cand = U_dec[
-                    l,
-                    ~self.frozen_bits
-                ]
-
-                if check_crc(u_cand, crc_poly):
-
-                    if PM[l] < best_pm_crc:
-
-                        best_pm_crc = PM[l]
-                        best_pm_idx = l
-
-        # --------------------------------------------------------
-        # Extract information bits
-        # --------------------------------------------------------
-
-        best_u = U_dec[
-            best_pm_idx,
-            ~self.frozen_bits
-        ]
-
-        # --------------------------------------------------------
-        # Sync metric
-        #
-        # EXACT same behavior as decode_scl()
-        # --------------------------------------------------------
-
-        if return_sync_metric:
-
-            if L == 1:
-
-                return (
-                    best_u,
-                    Frozen_Sum[0]
-                )
-
-            else:
-
-                return (
-                    best_u,
-                    -PM[best_pm_idx]
-                )
-
-        return best_u
+    def noise_only(self, num_trials, ebno_db):
+        """Channel logits [T, N] when nothing is transmitted (H0)."""
+        no = self.noise_var(ebno_db)
+        stream = torch.zeros((num_trials, self.N // self.bits_per_symbol),
+                             dtype=self.mapper.cdtype)
+        return self.demapper(self.channel(stream, no), no)

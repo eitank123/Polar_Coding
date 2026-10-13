@@ -1,15 +1,16 @@
 import time
 import numpy as np
 
-from config import *
-from utils import (
+from config import N, K_LIST, L
+from .utils_numpy import CRC_POLY
+from .utils_numpy import (
     get_frozen_bits,
     append_crc,
     get_noise_sigma,
     qpsk_modulate,
     qpsk_demodulate_llr,
 )
-from polar import PolarCode
+from .polar_numba import PolarCode
 
 
 # ============================================================
@@ -145,15 +146,16 @@ print("=" * 60)
 import time
 import numpy as np
 
-from config import *
-from utils import (
+from config import N, K_LIST, L
+from .utils_numpy import CRC_POLY
+from .utils_numpy import (
     get_frozen_bits,
     append_crc,
     get_noise_sigma,
     qpsk_modulate,
     qpsk_demodulate_llr,
 )
-from polar import PolarCode
+from .polar_numba import PolarCode
 
 
 # ============================================================
