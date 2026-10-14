@@ -6,8 +6,8 @@ import pytest
 
 import main
 
-PLOTS = ["polar_ber.png", "polar_bler.png", "polar_sync_prob.png", "polar_bler_genie.png",
-         "polar_bler_nosync.png", "polar_hypo_pmiss.png", "polar_hypo_pfalse.png",
+# polar_bler_genie.png / polar_bler_nosync.png are only drawn when genie and blind BLER differ
+PLOTS = ["polar_ber.png", "polar_bler.png", "polar_sync_prob.png", "polar_hypo_pmiss.png", "polar_hypo_pfalse.png",
          "part1_bler.csv", "part3_detection.csv",
          "polar_window_pmiss.png", "polar_window_pfalse.png", "polar_window_bler.png", "part4_window.csv",
          "polar_window_complexity.png", "progress.txt",

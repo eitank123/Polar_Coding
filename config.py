@@ -19,8 +19,8 @@ MODULATION = 'QPSK'
 BITS_PER_SYMBOL = 2
 
 # Simulation Parameters
-SNR_DB = np.arange(0, 6, 1)      # Eb/N0 sweep in dB (Parts 1/2)
-DETECTION_SNR_DB = np.arange(0, 11, 1)  # Eb/N0 sweep for the detection parts (3, 4, 5)
+SNR_DB = np.arange(0, 5.5, 0.5)  # Eb/N0 sweep in dB (Parts 1/2): 0..5 dB in 0.5 dB steps
+DETECTION_SNR_DB = np.arange(0, 3.25, 0.25)  # Eb/N0 sweep for the detection parts (3, 4, 5): 0..3 dB in 0.25 dB steps
 ITERATIONS = 64000               # Monte-Carlo trials per SNR point
 
 # Burst Transmission Parameters
@@ -41,8 +41,17 @@ SYNC_SCL_CANDIDATES = 8          # random mode: best SC-scan offsets re-scored b
 # stays the cap. None = always run ITERATIONS trials.
 TARGET_ERRORS = 1000
 
-NUM_H0_TRIALS = 32000            # Need >=1000 to resolve P_false = 1e-3 accurately
+NUM_H0_TRIALS = 96000            # Need >=1000 to resolve P_false = 1e-3 accurately
 NUM_H1_TRIALS = 16000            # (Parts 3-5 use these H0/H1 counts per SNR point)
+
+# Detector operating-point presets (Parts 3-5). P_miss target p allows floor(p * NUM_H1_TRIALS)
+# missed frames (0 -> the strictest "no frame missed" threshold = min H1 statistic).
+PFA_TARGETS = [1e-2, 1e-3, 1e-4]
+PMISS_TARGETS = [0, 1e-4, 1e-3, 1e-2]
+PMISS_OPERATING_POINT = 1e-3       # second P_miss operating point (besides 0) with its own P_false/BLER plots
+# Stop an SNR sweep (per K / scheme) at the first point where every reported error rate is 0:
+# higher SNRs can only give more zeros (below the Monte-Carlo resolution).
+STOP_SWEEP_AT_ZERO = True
 
 # Parts 4/5: sliding-window frame sync. The frame (preamble + data for ZC schemes)
 # starts at a uniform random QPSK-symbol offset 0..WINDOW_MAX_OFFSET_SYM inside a

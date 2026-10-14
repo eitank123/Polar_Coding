@@ -144,3 +144,19 @@ def test_detection_summary_with_gate_rejections():
     h1[0] = -np.inf  # a frame rejected by the gate makes P_miss = 0 unreachable
     s = main.detection_summary(h0, h1, ok, ok)
     assert s["h1_rejected_by_gate"] == 1 and s["p_false_at_pmiss_0"] == 1.0
+
+
+def test_pmiss_target_threshold_misses_fewest_frames():
+    """P_miss <= p allows misses, but on separable data none should be spent."""
+    h0 = np.linspace(-10, -5, 2000)
+    h1 = np.linspace(0, 5, 1000)
+    ok = np.ones(1000, bool)
+    s = main.detection_summary(h0, h1, ok, ok)
+    assert s["p_false_at_pmiss_1e-2"] == 0.0 and s["bler_at_pmiss_1e-3"] == 0.0
+    # overlapping data: the allowed misses are used only where they lower P_false
+    h1 = np.concatenate([np.full(5, -7.0), np.linspace(0, 5, 995)])  # 5 frames look like noise
+    s = main.detection_summary(h0, h1, ok, ok)
+    assert s["p_false_at_pmiss_0"] == pytest.approx(np.mean(h0 >= -7.0))
+    assert s["p_false_at_pmiss_1e-2"] == 0.0  # 10 misses allowed, 5 needed
+    # 1 allowed miss cannot lower P_false (5 noise-like frames), so none is spent
+    assert s["p_false_at_pmiss_1e-3"] == s["p_false_at_pmiss_0"] and s["bler_at_pmiss_1e-3"] == 0.0
